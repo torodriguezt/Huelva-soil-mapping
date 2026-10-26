@@ -1,32 +1,4 @@
-# =============================================================================
-# .gitignore - Bayesian Analysis Huelva
-# Whitelist: only the code and data needed to reproduce the results with
-# source("main.R"). Everything else stays local.
-# =============================================================================
-
-# Ignore everything, but keep descending into directories
-*
-!*/
-
-# Git configuration
-!/.gitignore
-!/.gitattributes
-
-# Documentation
-!/README.md
-
-# Pipeline (v3)
-!/main.R
-!/R/**/*.R
-
-# Scripts not called by main.R
-/R/overnight.R
-/R/All_Models/prepare_F3_reference.R
-/R/All_Models/model_F3_stan.R
-/R/All_Models/model_factors_stan.R
-/R/Results/Table_stan_vs_inla.R
-/R/utils/gp_prediction.R
-
-# Input data read by R/Data_preparation/config.R
-!/data/raw/**
-/data/raw/**/*.xlsx
+results/
+figures/
+data/raw/samples/
+__pycache__/
