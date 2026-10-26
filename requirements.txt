@@ -1,0 +1,8 @@
+numpy>=1.26
+scipy>=1.11
+pandas>=2.1
+matplotlib>=3.8
+threadpoolctl>=3.2
+geopandas>=1.0
+shapely>=2.0
+arviz>=0.17,<1.0
