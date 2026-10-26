@@ -1,4 +1,4 @@
-# Cross-validation, model selection and full-data fit of the selected model.
+# Cross-validation of the candidates and the univariate baseline, then the full-data fit of the selected model.
 import subprocess
 import sys
 
@@ -14,5 +14,6 @@ def python(script, *options):
 
 
 python("cross_validation.py")
+python("univariate_baseline.py")
 selected = read_json(DIR_CV / "selected_model.json")["selected"]
 python("fit_model.py", "--model", selected, *[f"--{k}={v}" for k, v in FULL_ITERATIONS.items()])

@@ -1,10 +1,10 @@
 # Spatial block cross-validation of the candidate models.
 import argparse
-import json
 import shutil
 import time
 import zlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from math import ceil
 from pathlib import Path
 
 import numpy as np
@@ -15,15 +15,17 @@ from scipy.spatial import cKDTree
 from scipy.special import log_ndtr, logsumexp
 from threadpoolctl import threadpool_limits
 
-from blmc.config import (BLOCK_SEED, CANDIDATES, CV_ITERATIONS, DIR_CV, DIR_MODEL_DATA, GROUPS, N_BLOCKS,
-                         UPPER_LIMITS)
-from blmc.io import load_folder, read_json, save_json
+from blmc.config import (BLOCK_SEED, CANDIDATES, CREDIBLE, CV_ITERATIONS, DIR_CV, DIR_MODEL_DATA, GROUPS, INTERVAL,
+                         MAX_RHAT, MIN_ESS, N_BLOCKS, UPPER_LIMITS)
 from blmc.diagnostics import diagnose
+from blmc.io import load_folder, read_json, save_json
 from blmc.model import design_matrix, parse_model
 from blmc.predict import conditional_predict
 from blmc.sampler import run_chain
 
 ARRAYS = ["beta", "loading", "Sigma", "rho", "F", "group_variance", "weights", "nu", "log_likelihood"]
+COVER = f"cover{round(100 * CREDIBLE)}"
+LENGTHS = ["warmup", "samples", "thin"]
 
 
 def make_folds(data):
@@ -84,6 +86,47 @@ def component_log_density(y, mean, cov, censored, lower):
     return observed + log_ndtr((m - lower[c]) / s)
 
 
+# scores of one held-out site from predictive draws of a new sample and of the spatial level
+def site_scores(site, lpd, samples, level, y, cens, lower, thr, fd, data, elements, rng):
+    regulated = data["regulated_indices"]
+    log_samples = samples * fd["scale"] + fd["center"]
+    log_observed = y * fd["scale"] + fd["center"]
+    exceed, level_exceed = samples > thr, level > thr
+    known = np.where(cens, np.where(lower > thr, 1.0, np.nan), (y > thr).astype(float))
+    if np.nansum(known[regulated]) > 0:
+        union_observed = 1.0
+    elif np.isnan(known[regulated]).any():
+        union_observed = np.nan
+    else:
+        union_observed = 0.0
+    union_p = np.any(exceed[:, regulated], axis=1).mean()
+    energy = np.nan
+    if not cens.any():
+        z_samples = (log_samples - data["center"]) / data["scale"]
+        z_observed = (log_observed - data["center"]) / data["scale"]
+        energy = np.mean(np.linalg.norm(z_samples - z_observed, axis=1)) - 0.5 * np.mean(
+            np.linalg.norm(z_samples - z_samples[rng.permutation(len(z_samples))], axis=1))
+    site_row = dict(site, censored_entries=int(cens.sum()), lpd=lpd, energy_score=energy, union_p=union_p,
+                    union_p_level=np.any(level_exceed[:, regulated], axis=1).mean(), union_observed=union_observed,
+                    union_brier=(union_p - union_observed) ** 2 if np.isfinite(union_observed) else np.nan)
+    element_rows = []
+    for j, e in enumerate(elements):
+        if cens[j]:
+            continue
+        lo50, hi50, lo, hi = np.quantile(log_samples[:, j], [0.25, 0.75, *INTERVAL])
+        p = exceed[:, j].mean() if j in regulated else np.nan
+        element_rows.append(dict(
+            fold=site["fold"], model=site["model"], id=site["id"], element=e,
+            crps=crps_samples(log_samples[:, j], log_observed[j]),
+            abs_error_median=abs(np.median(log_samples[:, j]) - log_observed[j]),
+            squared_error_mean=(log_samples[:, j].mean() - log_observed[j]) ** 2,
+            cover50=float(lo50 <= log_observed[j] <= hi50), **{COVER: float(lo <= log_observed[j] <= hi)},
+            exceed_p=p, exceed_p_level=level_exceed[:, j].mean() if j in regulated else np.nan,
+            exceed_observed=known[j] if j in regulated else np.nan,
+            brier=(p - known[j]) ** 2 if j in regulated and np.isfinite(known[j]) else np.nan))
+    return site_row, element_rows
+
+
 def score_fit(fold, model, chains, data, fd, elements, args):
     spec = parse_model(model)
     train, test = fd["train"], fd["test"]
@@ -113,7 +156,6 @@ def score_fit(fold, model, chains, data, fd, elements, args):
             parts["chain"].append(chain)
     mu, var_f, loading, Sigma, a, w, chain_of = (np.array(parts[key]) for key in parts)
     S = len(mu)
-    regulated = data["regulated_indices"]
     ids = data["ids"][test]
     per_draw = np.zeros(S)
     site_rows, element_rows = [], []
@@ -125,45 +167,13 @@ def score_fit(fold, model, chains, data, fd, elements, args):
         jacobian = -np.log(fd["scale"][~cens[i]]).sum()
         per_draw += logsumexp(logdens.reshape(S, M), axis=1) - np.log(M) + jacobian
         lpd = logsumexp(logdens) - np.log(S * M) + jacobian
-
         samples = mean + np.einsum("sqr,sr->sq", np.linalg.cholesky(cov), rng.standard_normal((S * M, q)))
-        log_samples = samples * fd["scale"] + fd["center"]
-        log_observed = y[i] * fd["scale"] + fd["center"]
-        exceed = samples > thr[i]
-        known = np.where(cens[i], np.where(lower[i] > thr[i], 1.0, np.nan), (y[i] > thr[i]).astype(float))
-        if np.nansum(known[regulated]) > 0:
-            union_observed = 1.0
-        elif np.isnan(known[regulated]).any():
-            union_observed = np.nan
-        else:
-            union_observed = 0.0
-        union_p = np.any(exceed[:, regulated], axis=1).mean()
         level = mu[:, i] + np.einsum("sk,skq->sq", np.sqrt(var_f[:, i]) * level_rng.standard_normal(var_f[:, i].shape), loading)
-        level_exceed = level > thr[i]
-        energy = np.nan
-        if not cens[i].any():
-            z_samples = (log_samples - data["center"]) / data["scale"]
-            z_observed = (log_observed - data["center"]) / data["scale"]
-            energy = np.mean(np.linalg.norm(z_samples - z_observed, axis=1)) - 0.5 * np.mean(
-                np.linalg.norm(z_samples - z_samples[rng.permutation(len(z_samples))], axis=1))
-        site_rows.append(dict(fold=fold, model=model, id=int(ids[i]), land_use=GROUPS[data["variance_group_index"][test][i]],
-                              group_in_training=bool(groups_test[i] >= 0), censored_entries=int(cens[i].sum()), lpd=lpd,
-                              energy_score=energy, union_p=union_p, union_p_level=np.any(level_exceed[:, regulated], axis=1).mean(),
-                              union_observed=union_observed,
-                              union_brier=(union_p - union_observed) ** 2 if np.isfinite(union_observed) else np.nan))
-        for j, e in enumerate(elements):
-            if cens[i, j]:
-                continue
-            lo50, hi50, lo90, hi90 = np.quantile(log_samples[:, j], [0.25, 0.75, 0.05, 0.95])
-            p = exceed[:, j].mean() if j in regulated else np.nan
-            element_rows.append(dict(
-                fold=fold, model=model, id=int(ids[i]), element=e, crps=crps_samples(log_samples[:, j], log_observed[j]),
-                abs_error_median=abs(np.median(log_samples[:, j]) - log_observed[j]),
-                squared_error_mean=(log_samples[:, j].mean() - log_observed[j]) ** 2,
-                cover50=float(lo50 <= log_observed[j] <= hi50), cover90=float(lo90 <= log_observed[j] <= hi90),
-                exceed_p=p, exceed_p_level=level_exceed[:, j].mean() if j in regulated else np.nan,
-                exceed_observed=known[j] if j in regulated else np.nan,
-                brier=(p - known[j]) ** 2 if j in regulated and np.isfinite(known[j]) else np.nan))
+        site = dict(fold=fold, model=model, id=int(ids[i]), land_use=GROUPS[data["variance_group_index"][test][i]],
+                    group_in_training=bool(groups_test[i] >= 0))
+        row, rows = site_scores(site, lpd, samples, level, y[i], cens[i], lower[i], thr[i], fd, data, elements, rng)
+        site_rows.append(row)
+        element_rows += rows
     iteration = np.concatenate([np.arange(1, (chain_of == c).sum() + 1) for c in np.unique(chain_of)])
     return pd.DataFrame(site_rows), pd.DataFrame(element_rows), dict(chain=chain_of, iteration=iteration,
                                                                      heldout_block_lppd=per_draw)
@@ -190,17 +200,22 @@ def fit_monitors(chains, fd, model, elements, args, block_monitor):
                                                     validate="one_to_one")
 
 
-def finish_fit(fold, model, chains, data, fd, elements, args, elapsed, settings):
+# a longer rerun moves the earlier fit to superseded/
+def fit_folder(fold, model):
     folder = DIR_CV / f"fold{fold:02d}_{model}"
-    if (folder / "fit_status.json").exists():   # a longer rerun replaces the fit; the earlier one moves to superseded/
+    if (folder / "fit_status.json").exists():
         old = read_json(folder / "fit_status.json")
-        tag = "-".join(str(old.get(k, args.original[k])) for k in ["warmup", "samples", "thin"])
-        target = DIR_CV / "superseded" / f"{folder.name}_{tag}"
+        target = DIR_CV / "superseded" / f"{folder.name}_{'-'.join(str(old[k]) for k in LENGTHS)}"
         target.parent.mkdir(exist_ok=True)
         if target.exists():
             shutil.rmtree(target)
         folder.rename(target)
     folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def finish_fit(fold, model, chains, data, fd, elements, args, elapsed, settings):
+    folder = fit_folder(fold, model)
     sites, element_scores, block_monitor = score_fit(fold, model, chains, data, fd, elements, args)
     sites.to_csv(folder / "site_scores.csv", index=False)
     element_scores.to_csv(folder / "element_scores.csv", index=False)
@@ -217,7 +232,61 @@ def finish_fit(fold, model, chains, data, fd, elements, args, elapsed, settings)
           f"({status['worst_rhat_variable']}), held-out lpd R-hat {status['heldout_lppd_rhat']:.3f}", flush=True)
 
 
-def summarize(models, folds):
+def run_fits(entries, models, data, blocks, elements, args, exact_lengths=True):
+    fold_inputs = {fold: fold_data(data, blocks, fold, elements) for fold in sorted({e["fold"] for e in entries})}
+    tasks, settings = [], {}
+    for e in entries:
+        fold, model = e["fold"], e["model"]
+        length = {k: e[k] for k in LENGTHS}
+        status = DIR_CV / f"fold{fold:02d}_{model}" / "fit_status.json"
+        if status.exists() and (not exact_lengths or all(read_json(status).get(k) == v for k, v in length.items())):
+            continue
+        fd, spec = fold_inputs[fold], parse_model(model)
+        train = fd["train"]
+        settings[(fold, model)] = length
+        for c in range(1, args.chains + 1):
+            tasks.append(dict(Y=fd["Y"][train], coords=data["coords"][train], X=design_matrix(data, spec["design"])[train],
+                              groups=fd["groups"][train], K=spec["K"], robust=spec["robust"],
+                              censored=fd["censored"][train], lower=fd["lower"][train], fold=fold, model=model, chain=c,
+                              seed=20261200 + 10000 * c + 100 * fold + 10 * models.index(model), **length))
+    print(f"{len(tasks)} chains for {len(tasks) // args.chains} fits", flush=True)
+    pending, seconds, failures = {}, {}, []
+    with ProcessPoolExecutor(max_workers=args.workers) as pool:
+        futures = {pool.submit(chain_task, t): (t["fold"], t["model"], t["chain"]) for t in tasks}
+        for future in as_completed(futures):
+            try:
+                fold, model, chain, arrays, elapsed = future.result()
+            except Exception as error:   # the fit stays unfinished; a rerun redoes only that fit
+                failures.append(dict(zip(["fold", "model", "chain"], futures[future]), error=repr(error)))
+                print(f"FAILED chain {futures[future]}: {error!r}", flush=True)
+                continue
+            key = (fold, model)
+            pending.setdefault(key, []).append((chain, arrays))
+            seconds.setdefault(key, []).append(elapsed)
+            if len(pending[key]) == args.chains:
+                try:
+                    finish_fit(fold, model, sorted(pending.pop(key), key=lambda item: item[0]), data, fold_inputs[fold],
+                               elements, args, seconds[key], settings[key])
+                except Exception as error:
+                    failures.append(dict(fold=fold, model=model, chain=None, error=repr(error)))
+                    print(f"FAILED scoring fold {fold} {model}: {error!r}", flush=True)
+    return failures
+
+
+# fits failing the convergence criteria at the base length, with chains 2 to 6 times longer
+def lengthened(entries):
+    out = []
+    for e in entries:
+        status = read_json(DIR_CV / f"fold{e['fold']:02d}_{e['model']}" / "fit_status.json")
+        ess = min(status["min_ess_bulk"], status["min_ess_tail"])
+        if status["samples"] != e["samples"] or (status["max_rhat"] <= MAX_RHAT and ess >= MIN_ESS):
+            continue
+        factor = 6 if status["max_rhat"] > 1.05 else min(6, max(2, ceil(1.3 * MIN_ESS / ess)))
+        out.append(dict(e, warmup=factor * e["warmup"], samples=factor * e["samples"]))
+    return out
+
+
+def summarize(candidates, folds):
     statuses = [read_json(p) for p in sorted(DIR_CV.glob("fold*/fit_status.json"))]
     folders = [DIR_CV / f"fold{s['fold']:02d}_{s['model']}" for s in statuses]
     sites = pd.concat([pd.read_csv(f / "site_scores.csv") for f in folders], ignore_index=True)
@@ -227,18 +296,18 @@ def summarize(models, folds):
     sites.to_csv(DIR_CV / "cv_site_scores.csv", index=False)
     elements.to_csv(DIR_CV / "cv_element_scores.csv", index=False)
 
+    # candidates and baselines (the univariate model) scored on every site
     complete = sites.groupby("model").id.nunique()
-    models = [m for m in models if m in complete.index and complete[m] == complete.max()]
+    models = [m for m in list(candidates) + sorted(set(sites.model) - set(candidates)) if complete.get(m) == complete.max()]
     sites, elements = sites[sites.model.isin(models)], elements[elements.model.isin(models)]
     rows = []
     for model in models:
         s, e, c = sites[sites.model == model], elements[elements.model == model], convergence[convergence.model == model]
         rows.append(dict(model=model, n_sites=len(s), lpd_mean=s.lpd.mean(), lpd_sum=s.lpd.sum(),
                          energy_score_mean=s.energy_score.mean(), crps_mean=e.crps.mean(), mae_median=e.abs_error_median.mean(),
-                         rmse_mean=np.sqrt(e.squared_error_mean.mean()), cover50=e.cover50.mean(), cover90=e.cover90.mean(),
+                         rmse_mean=np.sqrt(e.squared_error_mean.mean()), cover50=e.cover50.mean(), **{COVER: e[COVER].mean()},
                          brier_elements=e.brier.mean(), brier_union=s.union_brier.mean(), fits=len(c),
-                         fits_rhat_above_1p01=int((c.max_rhat > 1.01).sum()),
-                         fits_heldout_lppd_rhat_above_1p01=int((c.heldout_lppd_rhat > 1.01).sum()),
+                         fits_not_converged=int(((c.max_rhat > MAX_RHAT) | (c.min_ess_bulk < MIN_ESS) | (c.min_ess_tail < MIN_ESS)).sum()),
                          worst_max_rhat=c.max_rhat.max(), worst_heldout_lppd_rhat=c.heldout_lppd_rhat.max()))
     pd.DataFrame(rows).to_csv(DIR_CV / "cv_model_summary.csv", index=False)
 
@@ -265,16 +334,17 @@ def summarize(models, folds):
     pairwise.to_csv(DIR_CV / "cv_pairwise.csv", index=False)
     elements.groupby(["model", "element"]).agg(
         crps=("crps", "mean"), mae_median=("abs_error_median", "mean"), rmse=("squared_error_mean", lambda v: np.sqrt(v.mean())),
-        cover50=("cover50", "mean"), cover90=("cover90", "mean"), brier=("brier", "mean")).reset_index().to_csv(
+        cover50=("cover50", "mean"), **{COVER: (COVER, "mean")}, brier=("brier", "mean")).reset_index().to_csv(
         DIR_CV / "cv_by_element.csv", index=False)
-    select_model(pairwise, ranked, convergence)
+    select_model(pairwise, [m for m in ranked if m in candidates], convergence)
     print(pd.DataFrame(rows).round(4).to_string(index=False))
 
 
+# simplest candidate within one block-level standard error of the best held-out lpd
 def select_model(pairwise, ranked, convergence):
     lpd = pairwise[pairwise.score == "lpd"].set_index("comparison")
     rhat = convergence.groupby("model").heldout_lppd_rhat.max()
-    eligible = [m for m in ranked if rhat.get(m, np.inf) <= 1.01] or list(ranked)
+    eligible = [m for m in ranked if rhat.get(m, np.inf) <= MAX_RHAT] or list(ranked)
     best = eligible[0]
     within = [best] + [m for m in eligible[1:] if lpd.loc[f"{best} - {m}"].total_difference <= lpd.loc[f"{best} - {m}"].se_total_block]
 
@@ -301,61 +371,26 @@ def main(args):
     if args.summarize_only:
         summarize(models, folds)
         return
-    args.original = {k: previous.get(k, getattr(args, k)) for k in ["warmup", "samples", "thin"]}
 
     if args.plan:
         plan = read_json(Path(args.plan))
         (DIR_CV / "reruns").mkdir(exist_ok=True)
         save_json(DIR_CV / "reruns" / f"plan_{time.strftime('%Y%m%d_%H%M')}.json", dict(plan=plan, chains=args.chains))
-        entries = [dict(model=e["model"], fold=f, warmup=e["warmup"], samples=e["samples"], thin=e["thin"])
-                   for e in plan for f in e["folds"]]
+        entries = [dict(model=e["model"], fold=f, **{k: e[k] for k in LENGTHS}) for e in plan for f in e["folds"]]
+        failures = run_fits(entries, models, data, blocks, elements, args)
     else:
         save_json(DIR_CV / "specification.json", dict(
             models=models, n_blocks=N_BLOCKS, kmeans_seed=BLOCK_SEED, block_sizes=np.bincount(blocks).tolist(),
             heldout_nearest_training_m=dict(zip(["q25", "q50", "q75", "q90"], np.quantile(distance, [0.25, 0.5, 0.75, 0.9]).round(1))),
             warmup=args.warmup, samples=args.samples, thin=args.thin, chains=args.chains, score_stride=args.score_stride,
-            weight_draws=args.weight_draws))
+            weight_draws=args.weight_draws, max_rhat=MAX_RHAT, min_ess=MIN_ESS))
         entries = [dict(model=m, fold=f, warmup=args.warmup, samples=args.samples, thin=args.thin)
                    for f in (args.folds or range(N_BLOCKS)) for m in models]
-
-    fold_inputs = {fold: fold_data(data, blocks, fold, elements) for fold in sorted({e["fold"] for e in entries})}
-    tasks, settings = [], {}
-    for e in entries:
-        fold, model = e["fold"], e["model"]
-        length = {k: e[k] for k in ["warmup", "samples", "thin"]}
-        status = DIR_CV / f"fold{fold:02d}_{model}" / "fit_status.json"
-        if status.exists() and (not args.plan or all(read_json(status).get(k) == v for k, v in length.items())):
-            continue
-        fd, spec_model = fold_inputs[fold], parse_model(model)
-        train = fd["train"]
-        settings[(fold, model)] = length
-        for c in range(1, args.chains + 1):
-            tasks.append(dict(Y=fd["Y"][train], coords=data["coords"][train], X=design_matrix(data, spec_model["design"])[train],
-                              groups=fd["groups"][train], K=spec_model["K"], robust=spec_model["robust"],
-                              censored=fd["censored"][train], lower=fd["lower"][train], fold=fold, model=model, chain=c,
-                              seed=20261200 + 10000 * c + 100 * fold + 10 * models.index(model), **length))
-    print(f"{len(tasks)} chains for {len(tasks) // args.chains} fits", flush=True)
-
-    pending, seconds, failures = {}, {}, []
-    with ProcessPoolExecutor(max_workers=args.workers) as pool:
-        futures = {pool.submit(chain_task, t): (t["fold"], t["model"], t["chain"]) for t in tasks}
-        for future in as_completed(futures):
-            try:
-                fold, model, chain, arrays, elapsed = future.result()
-            except Exception as error:   # the fit stays unfinished; a rerun redoes only that fit
-                failures.append(dict(zip(["fold", "model", "chain"], futures[future]), error=repr(error)))
-                print(f"FAILED chain {futures[future]}: {error!r}", flush=True)
-                continue
-            key = (fold, model)
-            pending.setdefault(key, []).append((chain, arrays))
-            seconds.setdefault(key, []).append(elapsed)
-            if len(pending[key]) == args.chains:
-                try:
-                    finish_fit(fold, model, sorted(pending.pop(key), key=lambda item: item[0]), data, fold_inputs[fold],
-                               elements, args, seconds[key], settings[key])
-                except Exception as error:
-                    failures.append(dict(fold=fold, model=model, chain=None, error=repr(error)))
-                    print(f"FAILED scoring fold {fold} {model}: {error!r}", flush=True)
+        failures = run_fits(entries, models, data, blocks, elements, args, exact_lengths=False)
+        if args.lengthen and not failures:
+            longer = lengthened(entries)
+            print(f"{len(longer)} fits rerun with longer chains", flush=True)
+            failures = run_fits(longer, models, data, blocks, elements, args)
     if failures:
         pd.DataFrame(failures).to_csv(DIR_CV / "failures.csv", index=False)
     summarize(models, folds)
@@ -367,6 +402,8 @@ if __name__ == "__main__":
     parser.add_argument("--models", nargs="*", default=None, help="default: the candidates in blmc/config.py")
     parser.add_argument("--folds", type=int, nargs="*", default=None, help="subset of folds, for quick tests")
     parser.add_argument("--plan", default=None, help="JSON list of {model, folds, warmup, samples, thin}")
+    parser.add_argument("--no-lengthen", dest="lengthen", action="store_false",
+                        help="do not rerun the fits that fail the convergence criteria")
     parser.add_argument("--warmup", type=int, default=CV_ITERATIONS["warmup"])
     parser.add_argument("--samples", type=int, default=CV_ITERATIONS["samples"])
     parser.add_argument("--thin", type=int, default=CV_ITERATIONS["thin"])
