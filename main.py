@@ -18,7 +18,7 @@ run("Data_preparation/covariates.py")
 run("Data_preparation/build_model_data.py")
 run("Data_preparation/build_model_data.py", "--keep137")
 run("All_Models/All_Models.py")                 # results/cv/, results/fits/
-run("Robustness/Robustness.py")                 # results/fits/sensitivity/
 run("Results/grid_predictions.py")              # results/maps/
 run("Results/area_intervals.py")                # results/areas/
+run("Robustness/Robustness.py")                 # results/fits/sensitivity/, results/maps/sensitivity/
 run("Results/Results.py")                       # results/checks/, results/tables/, figures/
