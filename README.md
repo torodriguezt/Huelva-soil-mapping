@@ -43,14 +43,18 @@ used in the manuscript.
 
 `Python/blmc/sampler.py` fits
 
-```text
-Y_i = X_i beta + F_i Lambda + E_i,   E_i | w_i ~ N(0, a_g Sigma / w_i),   w_i ~ Gamma(nu/2, nu/2)
-```
+$$
+\mathbf{y}_i = \mathbf{x}_i^\top \boldsymbol{\beta} + \mathbf{f}_i^\top \boldsymbol{\Lambda} + \mathbf{e}_i, \qquad
+\mathbf{e}_i \mid w_i \sim \mathcal{N}_q\!\left(\mathbf{0},\, \frac{a_{g(i)}}{w_i}\,\boldsymbol{\Sigma}\right), \qquad
+w_i \sim \mathrm{Gamma}\!\left(\frac{\nu}{2}, \frac{\nu}{2}\right)
+$$
 
-for standardized log concentrations, with Matérn 3/2 Gaussian-process factors F, land-use
-variance scales a_g (agricultural soils fixed at 1) and right-censoring of Cu and Sn at their
-upper reporting limits. The spatial factor part follows Zhang and Banerjee (2022); the
-Student-t errors, land-use scales and censoring are our extensions.
+for the standardized log concentrations $\mathbf{y}_i$ of the $q$ elements at site $i$, with
+Matérn 3/2 Gaussian-process factors $\mathbf{f}_i$, land-use variance scales $a_g$ (agricultural
+soils fixed at $a_g = 1$) and right-censoring of Cu and Sn at their upper reporting limits.
+Integrating out $w_i$ gives a multivariate Student-$t$ local error with $\nu$ degrees of freedom.
+The spatial factor part follows Zhang and Banerjee (2022); the Student-$t$ errors, land-use
+scales and censoring are our extensions.
 
 ## Data
 
