@@ -1,4 +1,10 @@
 results/
 figures/
-data/raw/samples/
 __pycache__/
+
+# survey results: available from the authors on request
+data/raw/samples/
+
+# layers not used by the analysis
+data/raw/boundaries/
+data/raw/land_use/samples/Muestra_part2/Agric/
