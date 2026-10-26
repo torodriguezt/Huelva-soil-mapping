@@ -8,28 +8,32 @@ import pandas as pd
 from scipy.special import ndtr
 from scipy.stats import t as student_t
 
-from blmc.config import DIR_FITS, DIR_MODEL_DATA, FULL_ITERATIONS, GROUPS, NGR_USES
+from blmc import sampler, sampler_groups
+from blmc.config import DIR_FITS, DIR_MODEL_DATA, ELEMENT_GROUPS, FULL_ITERATIONS, GROUPS, INTERVAL, NGR_USES
 from blmc.covariance import to_correlation
-from blmc.io import load_folder, save_json
 from blmc.diagnostics import diagnose
-from blmc.model import censoring, parse_model
-from blmc.sampler import run_chain
+from blmc.io import load_folder, save_json
+from blmc.model import censoring, element_group_index, local_scales, parse_model
 
 PAIRS = [("As", "Tl"), ("As", "Pb"), ("As", "Cu"), ("As", "V"), ("V", "Sc"), ("V", "Al"), ("V", "Ga"), ("Co", "As"), ("Co", "V")]
 TRACKED_SITES = [37, 59, 61, 69, 125, 35, 5, 97, 52, 83]
 
 
 def chain_task(task):
-    draws, summary = run_chain(task["Y"], task["coords"], task["X"], task["groups"], task["K"], task["warmup"],
-                               task["samples"], task["thin"], task["seed"], config=task["config"],
-                               censored=task["censored"], censor_lower=task["lower"],
-                               report_every=10000, label=f"chain {task['chain']}")
+    options = dict(config=task["config"], censored=task["censored"], censor_lower=task["lower"], report_every=10000,
+                   label=f"chain {task['chain']}")
+    lengths = (task["K"], task["warmup"], task["samples"], task["thin"], task["seed"])
+    if task["element_group"] is None:
+        draws, summary = sampler.run_chain(task["Y"], task["coords"], task["X"], task["groups"], *lengths, **options)
+    else:
+        draws, summary = sampler_groups.run_chain(task["Y"], task["coords"], task["X"], task["groups"],
+                                                  task["element_group"], *lengths, **options)
     np.savez_compressed(task["path"], **draws)
     save_json(task["path"].with_suffix(".json"), summary)
     return task["chain"]
 
 
-def monitors(chain, draws, data, elements, robust):
+def monitors(chain, draws, data, elements, robust, element_group=None):
     beta, loading, Sigma, rho, F, a, w, nu = (draws[key] for key in
                                               ["beta", "loading", "Sigma", "rho", "F", "group_variance", "weights", "nu"])
     S = len(beta)
@@ -40,7 +44,7 @@ def monitors(chain, draws, data, elements, robust):
     centered = W - W.mean(axis=1, keepdims=True)
     mu = np.einsum("np,spj->snj", data["X"], beta) + W
     groups = data["variance_group_index"]
-    scale_row = a[:, groups]
+    scale = local_scales(a, groups, element_group)
 
     cols = {"chain": np.full(S, chain), "iteration": draws["iteration"]}
     for p, label in enumerate(data["X_labels"]):
@@ -50,7 +54,11 @@ def monitors(chain, draws, data, elements, robust):
         cols[f"variance_spatial_{e}"] = var0[:, j]
         cols[f"variance_local_Agric_{e}"] = varE[:, j]
     for g, label in enumerate(GROUPS[1:], start=1):
-        cols[f"local_variance_ratio_{label}_vs_Agric"] = a[:, g]
+        if element_group is None:
+            cols[f"local_variance_ratio_{label}_vs_Agric"] = a[:, g]
+        else:
+            for c, name in enumerate(ELEMENT_GROUPS):
+                cols[f"local_variance_ratio_{label}_{name}_vs_Agric"] = a[:, g, c]
     for left, right in PAIRS:
         j, k = elements.index(left), elements.index(right)
         cols[f"cor_spatial_{left}_{right}"] = cor0[:, j, k]
@@ -70,7 +78,8 @@ def monitors(chain, draws, data, elements, robust):
         cols[f"lengthscale_{k}_km"] = values
     for e in ["As", "Tl", "V", "Co"]:
         j = elements.index(e)
-        z = (data["threshold_z"][None, :, j] - mu[:, :, j]) / np.sqrt(scale_row * varE[:, j, None])
+        scale_j = scale[:, :, j] if element_group is not None else scale[:, :, 0]
+        z = (data["threshold_z"][None, :, j] - mu[:, :, j]) / np.sqrt(scale_j * varE[:, j, None])
         cols[f"mean_p_new_{e}"] = (student_t.sf(z, nu[:, None]) if robust else 1 - ndtr(z)).mean(axis=1)
     cols["log_likelihood"] = draws["log_likelihood"]
     if robust:
@@ -88,7 +97,7 @@ def monitors(chain, draws, data, elements, robust):
     counts = []
     for s in range(S):
         w_new = rng.gamma(nu[s] / 2, 2 / nu[s], size=len(groups)) if robust else np.ones(len(groups))
-        replicate = mu[s] + np.sqrt(scale_row[s] / w_new)[:, None] * (rng.normal(size=mu[s].shape) @ np.linalg.cholesky(Sigma[s]).T)
+        replicate = mu[s] + np.sqrt(scale[s] / w_new[:, None]) * (rng.normal(size=mu[s].shape) @ np.linalg.cholesky(Sigma[s]).T)
         hit = replicate > data["threshold_z"]
         row = {"chain": chain, "iteration": int(draws["iteration"][s])}
         for scope, mask in masks.items():
@@ -115,11 +124,11 @@ def observed_counts(data, elements, masks):
 
 def site_weights(weights, data):
     inflation = 1 / weights
-    q = np.quantile(inflation, [0.05, 0.5, 0.95], axis=0)
+    q = np.quantile(inflation, [INTERVAL[0], 0.5, INTERVAL[1]], axis=0)
     xy = data["coords"] * 1000 + data["origin"]
     table = pd.DataFrame({"id": data["ids"], "land_use": np.array(GROUPS)[data["variance_group_index"]],
                           "x": xy[:, 0], "y": xy[:, 1], "weight_median": np.median(weights, axis=0),
-                          "inflation_median": q[1], "inflation_q05": q[0], "inflation_q95": q[2]})
+                          "inflation_median": q[1], "inflation_lower": q[0], "inflation_upper": q[2]})
     return table.sort_values("inflation_median", ascending=False)
 
 
@@ -132,6 +141,7 @@ def main(args):
         return
     spec, data = load_folder(DIR_MODEL_DATA / args.data)
     elements = spec["elements"]
+    element_group = element_group_index(elements) if args.element_groups else None
     if model["design"] == "use6":
         data["X"], data["X_labels"] = data["X_use6"], data["X_use6_labels"]
     data["censored"], data["censor_lower"] = censoring(data["Y"], data["center"], data["scale"], elements)
@@ -145,11 +155,13 @@ def main(args):
     save_json(out / "specification.json", dict(
         **spec, model=args.model, K=model["K"], robust=model["robust"], mean_design=model["design"], data=args.data,
         warmup=args.warmup, samples=args.samples, thin=args.thin, chains=args.chains, priors=config,
+        element_group=element_group, element_groups=list(ELEMENT_GROUPS) if args.element_groups else None,
         censored_entries=censored))
 
     tasks = [dict(Y=data["Y"], coords=data["coords"], X=data["X"], groups=data["variance_group_index"],
                   K=model["K"], warmup=args.warmup, samples=args.samples, thin=args.thin, config=config,
-                  censored=data["censored"], lower=data["censor_lower"], chain=c, path=out / f"chain_{c}.npz",
+                  censored=data["censored"], lower=data["censor_lower"], element_group=element_group, chain=c,
+                  path=out / f"chain_{c}.npz",
                   seed=20261022 + 1000 * c + 10 * model["K"] + (0 if model["robust"] else 5))
              for c in range(1, args.chains + 1)]
     print(f"{out.name}: {args.model}, {len(data['Y'])} sites, {len(elements)} elements, {len(censored)} censored entries")
@@ -163,17 +175,18 @@ def main(args):
             selected = np.arange(0, len(archive["beta"]), args.summary_stride)
             draws = {key: archive[key][selected] for key in archive.files}
         draws["iteration"] = selected + 1
-        table, count, masks = monitors(c, draws, data, elements, model["robust"])
+        table, count, masks = monitors(c, draws, data, elements, model["robust"], element_group)
         tables.append(table)
         counts.append(count)
         weights.append(draws["weights"])
     pd.concat(tables).to_csv(out / "monitors.csv", index=False)
     counts = pd.concat(counts, ignore_index=True)
     counts.to_csv(out / "posterior_replication_counts.csv", index=False)
-    summary = [dict(row, replicated_mean=counts[f"{row['event']}_{row['scope']}"].mean(),
-                    replicated_q05=counts[f"{row['event']}_{row['scope']}"].quantile(0.05),
-                    replicated_q95=counts[f"{row['event']}_{row['scope']}"].quantile(0.95))
-               for row in observed_counts(data, elements, masks)]
+    summary = []
+    for row in observed_counts(data, elements, masks):
+        values = counts[f"{row['event']}_{row['scope']}"]
+        summary.append(dict(row, replicated_mean=values.mean(), replicated_lower=values.quantile(INTERVAL[0]),
+                            replicated_upper=values.quantile(INTERVAL[1])))
     pd.DataFrame(summary).to_csv(out / "posterior_replication_summary.csv", index=False)
     if model["robust"]:
         site_weights(np.concatenate(weights), data).to_csv(out / "site_weights.csv", index=False)
@@ -202,4 +215,5 @@ if __name__ == "__main__":
     parser.add_argument("--group-prior-sd", type=float, default=1.0, help="SD of log a_g")
     parser.add_argument("--rho-prior-median-km", type=float, default=2.0, help="median of the log-normal length-scale prior")
     parser.add_argument("--rho-prior-sd", type=float, default=0.8)
+    parser.add_argument("--element-groups", action="store_true", help="local scales by land use and element group")
     main(parser.parse_args())
