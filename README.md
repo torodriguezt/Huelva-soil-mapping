@@ -1,60 +1,69 @@
-# Bayesian Analysis Huelva
+# Huelva soil mapping
 
-Bayesian spatial analysis of the Huelva topsoil survey. For each contamination
-source (element signature), the models separate the part of the signal that is
-mappable at the survey scale (a smooth Matern field) from the patchy,
-site-level part, and assess what this implies for compliance with the
-reference levels (NGR) of Decreto 18/2015. Models are fitted with INLA.
-
-## Requirements
-
-R 4.4 (tested with R 4.4.2, INLA 24.12.11, fmesher 0.5.0).
-
-```r
-install.packages(c("dplyr", "tidyr", "readr", "sf", "Matrix", "gstat", "units",
-                   "ggplot2", "patchwork", "ggspatial"))
-install.packages("INLA", repos = c(getOption("repos"),
-                 INLA = "https://inla.r-inla-download.org/R/stable"),
-                 dependencies = TRUE)
-```
+Bayesian multivariate spatial model for 22 elements in the topsoil of Huelva (SW Spain) and the
+exceedance of the generic reference levels (NGR) of Decreto 18/2015. The model separates the
+spatial level of each element from local site-to-site variation, and predicts both where the
+spatial level exceeds the NGR and where a new sample would.
 
 ## Run
 
-From the repository root, in a fresh R session:
+From the repository root, with the dependencies and input data in place:
 
-```r
-source("main.R")
+```sh
+python main.py
 ```
 
-`main.R` runs five stages in order:
+This reproduces the data, model fits, tables and figures of the article, including the
+appendices. The cross-validation (120 fits) takes about 8 hours and the full-data fits about
+1.5 hours on 20 threads. Python scripts can also be run one by one from the root after setting
+`PYTHONPATH=Python`, for example
 
-| Stage | Script | Output |
+```sh
+python Python/All_Models/fit_model.py --model t_K3_ngr
+python Python/All_Models/cross_validation.py --plan rerun_plan.json
+```
+
+Finished fits are skipped, so an interrupted run can be resumed.
+
+## Structure
+
+| Folder | Content | Output |
 | --- | --- | --- |
-| Data preparation | `R/Data_preparation/Data_preparation.R` | `results/data/` |
-| Exploratory analysis | `R/Exploratory/Exploratory.R` | `results/tables/exploratory/` |
-| Models F0-F3 | `R/All_Models/All_Models.R` | `results/fits/` |
-| Simulation check | `R/Robustness/Robustness.R` | `results/tables/simulation/` |
-| Tables and figures | `R/Results/Results.R` | `results/tables/`, `figures/` |
+| `Python/Data_preparation/` | samples, land use of sites and grid, standardized model input | `results/data/` |
+| `Python/All_Models/` | full-data fits and spatial block cross-validation | `results/cv/`, `results/fits/` |
+| `Python/Robustness/` | prior and record sensitivity | `results/fits/sensitivity/` |
+| `Python/Results/` | grid predictions, exceedance areas, residual checks, tables and figures | `results/`, `figures/` |
+| `Python/blmc/` | sampler, prediction, convergence diagnostics and shared helpers | |
 
-Fitting F3 can take a long time and a lot of memory.
+`results/` and `figures/` are generated and not tracked. Each CSV in `results/tables/` holds the
+numbers of one table of the article, named after its LaTeX label; figure files keep the names
+used in the manuscript.
+
+## Model
+
+`Python/blmc/sampler.py` fits
+
+```text
+Y_i = X_i beta + F_i Lambda + E_i,   E_i | w_i ~ N(0, a_g Sigma / w_i),   w_i ~ Gamma(nu/2, nu/2)
+```
+
+for standardized log concentrations, with Matérn 3/2 Gaussian-process factors F, land-use
+variance scales a_g (agricultural soils fixed at 1) and right-censoring of Cu and Sn at their
+upper reporting limits. The spatial factor part follows Zhang and Banerjee (2022); the
+Student-t errors, land-use scales and censoring are our extensions.
 
 ## Data
 
-`data/raw/` holds the input shapefiles: sample results for Huelva, Aroche and
-Campillo, the prediction grid, the mesh boundary, and land-use distance layers.
-Paths and study settings (elements, NGR thresholds, CRS) are in
-`R/Data_preparation/config.R`.
+`data/raw/` holds the survey results for Huelva, Aroche and Campillo, the prediction grid and
+the land-use layers. The survey results are not distributed. Paths and study settings (CRS,
+land-use classes, NGR, elements, models, chain lengths and output folders) are in
+`Python/blmc/config.py`.
 
-## License
+## Dependencies
 
-Copyright (C) 2026 Anonymous Authors. All rights reserved.
+Python 3.11 with the packages in `requirements.txt`.
 
-Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+## Model reference
 
-1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
-
-2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
-
-3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+Zhang L, Banerjee S (2022). Spatial factor modeling: a Bayesian matrix-normal approach for
+misaligned data. *Biometrics* 78:560–573.
