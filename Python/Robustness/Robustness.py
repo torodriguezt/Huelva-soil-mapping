@@ -1,20 +1,23 @@
-# Prior and record sensitivity refits of the selected model.
+# Prior, record and element-group sensitivity refits of the selected model.
 import subprocess
 import sys
 
 from blmc.config import DIR_CV, ROOT, SENSITIVITIES, SENSITIVITY_ITERATIONS
 from blmc.io import read_json
 
-selected = read_json(DIR_CV / "selected_model.json")["selected"]
-fit_model = ROOT / "Python" / "All_Models" / "fit_model.py"
-lengths = [f"--{k}={v}" for k, v in SENSITIVITY_ITERATIONS.items()]
-running = {name: subprocess.Popen([sys.executable, str(fit_model), "--model", selected, "--name", f"sensitivity/{name}",
-                                   *options, *lengths], cwd=ROOT)
-           for name, options in SENSITIVITIES.items()}
-failed = [name for name, process in running.items() if process.wait()]
-if failed:
-    raise SystemExit(f"sensitivity fits failed: {failed}")
+PYTHON = ROOT / "Python"
 
-review = ROOT / "Python" / "Robustness" / "sensitivity_review.py"
-if subprocess.run([sys.executable, str(review)], cwd=ROOT).returncode:
-    raise SystemExit("sensitivity_review.py failed")
+
+def run_together(commands):
+    running = [subprocess.Popen([sys.executable, *command], cwd=ROOT) for command in commands]
+    failed = [command for command, process in zip(commands, running) if process.wait()]
+    if failed:
+        raise SystemExit(f"failed: {failed}")
+
+
+selected = read_json(DIR_CV / "selected_model.json")["selected"]
+lengths = [f"--{k}={v}" for k, v in SENSITIVITY_ITERATIONS.items()]
+run_together([[str(PYTHON / "All_Models" / "fit_model.py"), "--model", selected, "--name", f"sensitivity/{name}", *options,
+               *lengths] for name, options in SENSITIVITIES.items()])
+run_together([[str(PYTHON / "Results" / "grid_predictions.py"), "--fit", f"sensitivity/{name}"] for name in SENSITIVITIES])
+run_together([[str(PYTHON / "Robustness" / "sensitivity_review.py")]])
