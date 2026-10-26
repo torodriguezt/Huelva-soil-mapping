@@ -1,7 +1,20 @@
 # Helpers shared by the full-data fits and the cross-validation.
 import numpy as np
 
-from blmc.config import UPPER_LIMITS
+from blmc.config import ELEMENT_GROUPS, UPPER_LIMITS
+
+
+def element_group_index(elements):
+    names = list(ELEMENT_GROUPS)
+    return np.array([next(names.index(g) for g, members in ELEMENT_GROUPS.items() if e in members) for e in elements])
+
+
+def local_scales(group_variance, groups, element_group=None):
+    """a for every site and element, (..., n, q); (..., n, 1) when one scale is shared by all elements."""
+    a = np.asarray(group_variance)
+    if element_group is None:
+        return a[..., groups][..., None]
+    return a[..., groups, :][..., np.asarray(element_group)]
 
 
 def parse_model(name):

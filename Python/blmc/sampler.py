@@ -1,4 +1,4 @@
-t# Gibbs sampler of the robust spatial factor model (Zhang and Banerjee 2022, extended).
+# Gibbs sampler of the robust spatial factor model (Zhang and Banerjee 2022, extended).
 import time
 from dataclasses import asdict, dataclass
 

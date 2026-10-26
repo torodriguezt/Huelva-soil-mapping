@@ -65,12 +65,26 @@ SELECTED_MODEL = "t_K3_ngr"
 N_BLOCKS, BLOCK_SEED = 20, 32
 VALIDATED_DISTANCE_M = 1618.0   # 90% of held-out sites are this close to a training site
 
+## posterior summaries: equal-tailed 95% credible intervals
+CREDIBLE = 0.95
+INTERVAL = ((1 - CREDIBLE) / 2, (1 + CREDIBLE) / 2)
+
 ## chain lengths (warm-up, saved draws, thinning)
 FULL_ITERATIONS = dict(warmup=10000, samples=8000, thin=5)
 SENSITIVITY_ITERATIONS = dict(warmup=6000, samples=6000, thin=4)
 CV_ITERATIONS = dict(warmup=3000, samples=2000, thin=4)
 
-## prior sensitivity: name -> options of fit_model.py
+## convergence: CV fits failing these are rerun once with chains 2 to 6 times longer
+MAX_RHAT, MIN_ESS = 1.01, 400
+
+## element groups of the local-scale sensitivity: clusters of the spatial correlations
+ELEMENT_GROUPS = {
+    "lithogenic": ["Ba", "Be", "Co", "Ni", "V", "Al", "Ga", "Sc", "Th"],
+    "phosphate": ["Tl", "P", "U"],
+    "sulfide": ["As", "Cd", "Cu", "Hg", "Mo", "Pb", "Sb", "Sn", "Zn", "Bi"],
+}
+
+## prior and record sensitivity: name -> options of fit_model.py
 SENSITIVITIES = {
     "nu_mean40": ["--nu-prior-rate", "0.05"],
     "nu_exponential": ["--nu-prior-shape", "1", "--nu-prior-rate", "0.1"],
@@ -79,4 +93,5 @@ SENSITIVITIES = {
     "rho_short": ["--rho-prior-median-km", "0.7"],
     "rho_long": ["--rho-prior-median-km", "6"],
     "keep137": ["--data", "keep137"],
+    "element_groups": ["--element-groups"],
 }
