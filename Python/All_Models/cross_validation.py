@@ -254,11 +254,12 @@ def run_fits(entries, models, data, blocks, elements, args, exact_lengths=True):
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         futures = {pool.submit(chain_task, t): (t["fold"], t["model"], t["chain"]) for t in tasks}
         for future in as_completed(futures):
+            label = futures.pop(future)   # so the draws are freed once the fit is scored
             try:
                 fold, model, chain, arrays, elapsed = future.result()
             except Exception as error:   # the fit stays unfinished; a rerun redoes only that fit
-                failures.append(dict(zip(["fold", "model", "chain"], futures[future]), error=repr(error)))
-                print(f"FAILED chain {futures[future]}: {error!r}", flush=True)
+                failures.append(dict(zip(["fold", "model", "chain"], label), error=repr(error)))
+                print(f"FAILED chain {label}: {error!r}", flush=True)
                 continue
             key = (fold, model)
             pending.setdefault(key, []).append((chain, arrays))
