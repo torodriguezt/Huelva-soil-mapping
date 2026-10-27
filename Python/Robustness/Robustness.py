@@ -1,4 +1,5 @@
 # Prior, record and element-group sensitivity refits of the selected model.
+import os
 import subprocess
 import sys
 
@@ -6,10 +7,12 @@ from blmc.config import DIR_CV, ROOT, SENSITIVITIES, SENSITIVITY_ITERATIONS
 from blmc.io import read_json
 
 PYTHON = ROOT / "Python"
+# chains use one BLAS thread; a single-threaded OpenBLAS also commits ~1.2 GB less per process
+ENV = dict(os.environ, OPENBLAS_NUM_THREADS="1")
 
 
 def run_together(commands):
-    running = [subprocess.Popen([sys.executable, *command], cwd=ROOT) for command in commands]
+    running = [subprocess.Popen([sys.executable, *command], cwd=ROOT, env=ENV) for command in commands]
     failed = [command for command, process in zip(commands, running) if process.wait()]
     if failed:
         raise SystemExit(f"failed: {failed}")
