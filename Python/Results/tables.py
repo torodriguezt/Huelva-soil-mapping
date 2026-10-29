@@ -2,7 +2,7 @@
 import numpy as np
 import pandas as pd
 
-from blmc.config import (CREDIBLE, DIR_AREAS, DIR_CHECKS, DIR_CV, DIR_FITS, DIR_MAPS, DIR_SENSITIVITY, DIR_TABLES, FOCUS,
+from blmc.config import (CREDIBLE, CV_ITERATIONS, DIR_AREAS, DIR_CHECKS, DIR_CV, DIR_FITS, DIR_MAPS, DIR_SENSITIVITY, DIR_TABLES, FOCUS,
                          GROUPS, MINOR, NGR_USES, SELECTED_MODEL, SENSITIVITIES)
 from blmc.io import read_json
 from blmc.model import parse_model
@@ -119,7 +119,7 @@ def convergence(fit):
         rows.append(dict(fit=f"cv/{model}", draws=f"4x{int(part.samples.min())}-{int(part.samples.max())}",
                          max_rhat=part.max_rhat.max(), min_ess_bulk=part.min_ess_bulk.min(),
                          min_ess_tail=part.min_ess_tail.min(), lpd_rhat=part.heldout_lppd_rhat.max(),
-                         lpd_ess_bulk=part.heldout_lppd_ess_bulk.min(), lengthened_fits=int((part.samples > part.samples.min()).sum())))
+                         lpd_ess_bulk=part.heldout_lppd_ess_bulk.min(), lengthened_fits=int((part.samples > CV_ITERATIONS["samples"]).sum())))
     return pd.DataFrame(rows)
 
 
